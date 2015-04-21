@@ -51,6 +51,7 @@ public class FlexiMergeDocTest {
       return new MergeLogic<ReadAllInputs, Pair<A, B>>() {
         @Override
         public State<ReadAllInputs, Pair<A, B>> initialState() {
+          System.out.println("creating Zip");
           return new State<ReadAllInputs, Pair<A, B>>(readAll(s.in0(), s.in1())) {
             @Override
             public State<ReadAllInputs, Pair<A, B>> onInput(
@@ -60,6 +61,7 @@ public class FlexiMergeDocTest {
               final A a = inputs.get(s.in0());
               final B b = inputs.get(s.in1());
 
+              System.out.println("emitting pair " + a + ":" + b);
               ctx.emit(new Pair<A, B>(a, b));
 
               return this;
@@ -302,7 +304,7 @@ public class FlexiMergeDocTest {
     //#fleximerge-zip-connecting    
 
     assertEquals(new Pair<>(1, "A"),
-            Await.result(future, FiniteDuration.create(3, TimeUnit.SECONDS)));
+            Await.result(future, FiniteDuration.create(3000, TimeUnit.SECONDS)));
   }
 
   @Test

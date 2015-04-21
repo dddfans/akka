@@ -111,14 +111,19 @@ private[akka] final case class Scan[In, Out](zero: Out, f: (Out, In) ⇒ Out, de
   private var pushedZero = false
 
   override def onPush(elem: In, ctx: Context[Out]): SyncDirective = {
-    aggregator = f(aggregator, elem)
-    ctx.push(aggregator)
+    if (pushedZero) {
+      aggregator = f(aggregator, elem)
+      ctx.push(aggregator)
+    } else {
+      aggregator = f(zero, elem)
+      ctx.push(zero)
+    }
   }
 
   override def onPull(ctx: Context[Out]): SyncDirective =
     if (!pushedZero) {
       pushedZero = true
-      if (ctx.isFinishing) ctx.pushAndFinish(zero) else ctx.push(zero)
+      if (ctx.isFinishing) ctx.pushAndFinish(aggregator) else ctx.push(aggregator)
     } else ctx.pull()
 
   override def onUpstreamFinish(ctx: Context[Out]): TerminationDirective =
