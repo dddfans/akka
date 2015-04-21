@@ -88,7 +88,6 @@ private[akka] case class ActorFlowMaterializerImpl(override val settings: ActorF
             assignPort(stage.outPort, processor)
             mat
 
-          //FIXME: Remove special case
           case tls: TlsModule ⇒
             val es = effectiveSettings(effectiveAttributes)
             val props = SslTlsCipherActor.props(es, tls.sslContext, tls.firstSession, tracing = true, tls.role, tls.closing)

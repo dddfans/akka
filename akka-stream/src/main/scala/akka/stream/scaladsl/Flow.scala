@@ -464,18 +464,6 @@ trait FlowOps[+Out, +Mat] {
    */
   def drop(n: Long): Repr[Out, Mat] = andThen(Drop(n))
 
-  def dropWhile(p: Out ⇒ Boolean): Repr[Out, Mat] =
-    transform(() ⇒ new PushStage[Out, Out] {
-      private var open = false
-      override def onPush(elem: Out, ctx: Context[Out]) =
-        if (open) ctx.push(elem)
-        else if (p(elem)) ctx.pull()
-        else {
-          open = true
-          ctx.push(elem)
-        }
-    })
-
   /**
    * Discard the elements received within the given duration at beginning of the stream.
    */

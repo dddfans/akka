@@ -55,6 +55,13 @@ class SslTlsCipherActor(settings: ActorFlowMaterializerSettings, sslContext: SSL
     override def onError(input: Int, e: Throwable): Unit = fail(e)
   }
 
+  /**
+   * The SSLEngine needs bite-sized chunks of data but we get arbitrary ByteString
+   * from both the UserIn and the TransportIn ports. This is used to chop up such
+   * a ByteString by filling the respective ByteBuffer and taking care to dequeue
+   * a new element when data are demanded and none are left lying on the chopping
+   * block.
+   */
   class ChoppingBlock(idx: Int, name: String) extends TransferState {
     override def isReady: Boolean = buffer.nonEmpty
     override def isCompleted: Boolean = false
@@ -77,6 +84,7 @@ class SslTlsCipherActor(settings: ActorFlowMaterializerSettings, sslContext: SSL
       b.compact()
       if (buffer.isEmpty) {
         buffer = inputBunch.dequeue(idx) match {
+          // this class handles both UserIn and TransportIn
           case bs: ByteString ⇒ bs
           case SendBytes(bs)  ⇒ bs
           case n: NegotiateNewSession ⇒
@@ -209,10 +217,14 @@ class SslTlsCipherActor(settings: ActorFlowMaterializerSettings, sslContext: SSL
   }
 
   val transportHasData = inputBunch.inputsOrCompleteAvailableFor(TransportIn) || transportInChoppingBlock
+  val userOutCancelled = new TransferState {
+    def isReady = outputBunch.isCancelled(UserOut)
+    def isCompleted = inputBunch.isDepleted(TransportIn)
+  }
 
   // bidirectional case
   val outbound = (userHasData || engineNeedsWrap) && outputBunch.demandAvailableFor(TransportOut)
-  val inbound = transportHasData && outputBunch.demandOrCancelAvailableFor(UserOut)
+  val inbound = (transportHasData || userOutCancelled) && outputBunch.demandOrCancelAvailableFor(UserOut)
 
   // half-closed
   val outboundHalfClosed = engineNeedsWrap && outputBunch.demandAvailableFor(TransportOut)
@@ -235,7 +247,8 @@ class SslTlsCipherActor(settings: ActorFlowMaterializerSettings, sslContext: SSL
         nextPhase(inboundClosed)
       } else {
         if (tracing) log.debug("closing inbound due to UserOut cancellation")
-        engine.closeOutbound()
+        engine.closeOutbound() // this is the correct way of shutting down the engine
+        lastHandshakeStatus = engine.getHandshakeStatus
         nextPhase(flushingOutbound)
       }
       true
@@ -259,6 +272,7 @@ class SslTlsCipherActor(settings: ActorFlowMaterializerSettings, sslContext: SSL
       } else {
         if (tracing) log.debug("closing outbound directly")
         engine.closeOutbound()
+        lastHandshakeStatus = engine.getHandshakeStatus
       }
       nextPhase(outboundClosed)
     } else if (outputBunch.isCancelled(TransportOut)) {
@@ -285,6 +299,13 @@ class SslTlsCipherActor(settings: ActorFlowMaterializerSettings, sslContext: SSL
   val flushingOutbound = TransferPhase(outboundHalfClosed) { () ⇒
     if (tracing) log.debug("flushingOutbound")
     try doWrap()
+    catch { case ex: SSLException ⇒ nextPhase(completedPhase) }
+  }
+
+  val awaitingClose = TransferPhase(inputBunch.inputsAvailableFor(TransportIn)) { () ⇒
+    if (tracing) log.debug("awaitingClose")
+    transportInChoppingBlock.chopInto(transportInBuffer)
+    try doUnwrap(ignoreOutput = true)
     catch { case ex: SSLException ⇒ nextPhase(completedPhase) }
   }
 
@@ -341,13 +362,15 @@ class SslTlsCipherActor(settings: ActorFlowMaterializerSettings, sslContext: SSL
       case CLOSED ⇒
         flushToTransport()
         if (engine.isInboundDone()) nextPhase(completedPhase)
+        else nextPhase(awaitingClose)
       case s ⇒ fail(new IllegalStateException(s"unexpected status $s in doWrap()"))
     }
   }
 
   @tailrec
-  private def doUnwrap(): Unit = {
+  private def doUnwrap(ignoreOutput: Boolean = false): Unit = {
     val result = engine.unwrap(transportInBuffer, userOutBuffer)
+    if (ignoreOutput) userOutBuffer.clear()
     lastHandshakeStatus = result.getHandshakeStatus
     if (tracing) log.debug(s"unwrap: status=${result.getStatus} handshake=$lastHandshakeStatus remaining=${transportInBuffer.remaining} out=${userOutBuffer.position}")
     runDelegatedTasks()
@@ -365,7 +388,8 @@ class SslTlsCipherActor(settings: ActorFlowMaterializerSettings, sslContext: SSL
         }
       case CLOSED ⇒
         flushToUser()
-        nextPhase(flushingOutbound)
+        if (engine.isOutboundDone()) nextPhase(completedPhase)
+        else nextPhase(flushingOutbound)
       case BUFFER_UNDERFLOW ⇒
         flushToUser()
       case BUFFER_OVERFLOW ⇒

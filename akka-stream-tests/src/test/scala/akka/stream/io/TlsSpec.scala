@@ -19,6 +19,9 @@ import javax.net.ssl.SSLSession
 import akka.pattern.{ after ⇒ later }
 import scala.concurrent.Future
 import java.net.InetSocketAddress
+import akka.testkit.EventFilter
+import akka.stream.stage.PushStage
+import akka.stream.stage.Context
 
 object TlsSpec {
 
@@ -45,6 +48,11 @@ object TlsSpec {
     context
   }
 
+  /**
+   * This is a stage that fires a TimeoutException failure 2 seconds after it was started,
+   * independent of the traffic going through. The purpose is to include the last seen
+   * element in the exception message to help in figuring out what went wrong.
+   */
   class Timeout()(implicit system: ActorSystem) extends AsyncStage[ByteString, ByteString, Unit] {
     private var last: ByteString = _
 
@@ -70,7 +78,25 @@ object TlsSpec {
     override def onUpstreamFinish(ctx: AsyncContext[ByteString, Unit]) =
       if (ctx.isHoldingUpstream) ctx.absorbTermination()
       else ctx.finish()
+
+    override def onDownstreamFinish(ctx: AsyncContext[ByteString, Unit]) = {
+      system.log.debug("cancelled")
+      ctx.finish()
+    }
   }
+
+  // FIXME #17226 replace by .dropWhile when implemented
+  class DropWhile[T](p: T ⇒ Boolean) extends PushStage[T, T] {
+    private var open = false
+    override def onPush(elem: T, ctx: Context[T]) =
+      if (open) ctx.push(elem)
+      else if (p(elem)) ctx.pull()
+      else {
+        open = true
+        ctx.push(elem)
+      }
+  }
+
 }
 
 class TlsSpec extends AkkaSpec("akka.loglevel=INFO\nakka.actor.debug.receive=off") {
@@ -100,21 +126,29 @@ class TlsSpec extends AkkaSpec("akka.loglevel=INFO\nakka.actor.debug.receive=off
     def serverTls(closing: Closing) = StreamTls(sslContext, cipherSuites, Server, closing)
 
     trait Named {
-      def name: String = getClass.getName.reverse.dropWhile(c ⇒ "$0123456789".indexOf(c) != -1).takeWhile(_ != '$').reverse
+      def name: String =
+        getClass.getName
+          .reverse
+          .dropWhile(c ⇒ "$0123456789".indexOf(c) != -1)
+          .takeWhile(_ != '$')
+          .reverse
     }
 
     trait CommunicationSetup extends Named {
-      def flow(leftClosing: Closing, rightClosing: Closing, flow: Flow[SslTlsInbound, SslTlsOutbound, Any]): Flow[SslTlsOutbound, SslTlsInbound, Any]
+      def decorateFlow(leftClosing: Closing, rightClosing: Closing,
+                       rhs: Flow[SslTlsInbound, SslTlsOutbound, Any]): Flow[SslTlsOutbound, SslTlsInbound, Unit]
     }
 
     object ClientInitiates extends CommunicationSetup {
-      def flow(leftClosing: Closing, rightClosing: Closing, flow: Flow[SslTlsInbound, SslTlsOutbound, Any]) =
-        clientTls(leftClosing) atop serverTls(rightClosing).reversed join flow
+      def decorateFlow(leftClosing: Closing, rightClosing: Closing,
+                       rhs: Flow[SslTlsInbound, SslTlsOutbound, Any]) =
+        clientTls(leftClosing) atop serverTls(rightClosing).reversed join rhs
     }
 
     object ServerInitiates extends CommunicationSetup {
-      def flow(leftClosing: Closing, rightClosing: Closing, flow: Flow[SslTlsInbound, SslTlsOutbound, Any]) =
-        serverTls(leftClosing) atop clientTls(rightClosing).reversed join flow
+      def decorateFlow(leftClosing: Closing, rightClosing: Closing,
+                       rhs: Flow[SslTlsInbound, SslTlsOutbound, Any]) =
+        serverTls(leftClosing) atop clientTls(rightClosing).reversed join rhs
     }
 
     def server(flow: Flow[ByteString, ByteString, Any]): InetSocketAddress = {
@@ -126,15 +160,17 @@ class TlsSpec extends AkkaSpec("akka.loglevel=INFO\nakka.actor.debug.receive=off
     }
 
     object ClientInitiatesViaTcp extends CommunicationSetup {
-      def flow(leftClosing: Closing, rightClosing: Closing, flow: Flow[SslTlsInbound, SslTlsOutbound, Any]) = {
-        val local = server(serverTls(rightClosing).reversed join flow)
+      def decorateFlow(leftClosing: Closing, rightClosing: Closing,
+                       rhs: Flow[SslTlsInbound, SslTlsOutbound, Any]) = {
+        val local = server(serverTls(rightClosing).reversed join rhs)
         clientTls(leftClosing) join StreamTcp().outgoingConnection(local)
       }
     }
 
     object ServerInitiatesViaTcp extends CommunicationSetup {
-      def flow(leftClosing: Closing, rightClosing: Closing, flow: Flow[SslTlsInbound, SslTlsOutbound, Any]) = {
-        val local = server(clientTls(rightClosing).reversed join flow)
+      def decorateFlow(leftClosing: Closing, rightClosing: Closing,
+                       rhs: Flow[SslTlsInbound, SslTlsOutbound, Any]) = {
+        val local = server(clientTls(rightClosing).reversed join rhs)
         serverTls(leftClosing) join StreamTcp().outgoingConnection(local)
       }
     }
@@ -211,7 +247,8 @@ class TlsSpec extends AkkaSpec("akka.loglevel=INFO\nakka.actor.debug.receive=off
       def output = ByteString("hello")
     }
 
-    object ImpatientRHS extends PayloadScenario {
+    // this demonstrates that cancellation is ignored so that the five results make it back
+    object CancellingRHS extends PayloadScenario {
       override def flow =
         Flow[SslTlsInbound]
           .mapConcat {
@@ -219,13 +256,45 @@ class TlsSpec extends AkkaSpec("akka.loglevel=INFO\nakka.actor.debug.receive=off
             case SessionBytes(s, bytes) ⇒ bytes.map(b ⇒ SessionBytes(s, ByteString(b)))
           }
           .take(5)
-          .mapAsync(10, x ⇒ later(500.millis, system.scheduler)(Future.successful(x)))
+          .mapAsync(5, x ⇒ later(500.millis, system.scheduler)(Future.successful(x)))
           .via(super.flow)
       override def rightClosing = IgnoreCancel
 
       val str = "abcdef" * 100
       def inputs = str.map(send)
       def output = ByteString(str.take(5))
+    }
+
+    object CancellingRHSIgnoresBoth extends PayloadScenario {
+      override def flow =
+        Flow[SslTlsInbound]
+          .mapConcat {
+            case SessionTruncated       ⇒ SessionTruncated :: Nil
+            case SessionBytes(s, bytes) ⇒ bytes.map(b ⇒ SessionBytes(s, ByteString(b)))
+          }
+          .take(5)
+          .mapAsync(5, x ⇒ later(500.millis, system.scheduler)(Future.successful(x)))
+          .via(super.flow)
+      override def rightClosing = IgnoreBoth
+
+      val str = "abcdef" * 100
+      def inputs = str.map(send)
+      def output = ByteString(str.take(5))
+    }
+
+    object LHSIgnoresBoth extends PayloadScenario {
+      override def leftClosing = IgnoreBoth
+      val str = "0123456789"
+      def inputs = str.map(ch ⇒ SendBytes(ByteString(ch.toByte)))
+      def output = ByteString(str)
+    }
+
+    object BothSidesIgnoreBoth extends PayloadScenario {
+      override def leftClosing = IgnoreBoth
+      override def rightClosing = IgnoreBoth
+      val str = "0123456789"
+      def inputs = str.map(ch ⇒ SendBytes(ByteString(ch.toByte)))
+      def output = ByteString(str)
     }
 
     object SessionRenegotiationBySender extends PayloadScenario {
@@ -277,7 +346,7 @@ class TlsSpec extends AkkaSpec("akka.loglevel=INFO\nakka.actor.debug.receive=off
         EmptyBytesFirst,
         EmptyBytesInTheMiddle,
         EmptyBytesLast,
-        ImpatientRHS,
+        CancellingRHS,
         SessionRenegotiationBySender,
         SessionRenegotiationByReceiver,
         SessionRenegotiationFirstOne,
@@ -291,22 +360,32 @@ class TlsSpec extends AkkaSpec("akka.loglevel=INFO\nakka.actor.debug.receive=off
         val onRHS = debug.via(scenario.flow)
         val f =
           Source(scenario.inputs)
-            .via(commPattern.flow(scenario.leftClosing, scenario.rightClosing, onRHS))
+            .via(commPattern.decorateFlow(scenario.leftClosing, scenario.rightClosing, onRHS))
+            .transform(() ⇒ new PushStage[SslTlsInbound, SslTlsInbound] {
+              override def onPush(elem: SslTlsInbound, ctx: Context[SslTlsInbound]) =
+                ctx.push(elem)
+              override def onDownstreamFinish(ctx: Context[SslTlsInbound]) = {
+                system.log.debug("me cancelled")
+                ctx.finish()
+              }
+            })
             .via(debug)
             .collect { case SessionBytes(_, b) ⇒ b }
             .scan(ByteString.empty)(_ ++ _)
             .transform(() ⇒ new Timeout)
-            .dropWhile(_.size < scenario.output.size)
+            .transform(() ⇒ new DropWhile(_.size < scenario.output.size))
             .runWith(Sink.head)
 
         Await.result(f, 3.seconds).utf8String should be(scenario.output.utf8String)
+
+        // flush log so as to not mix up logs of different test cases
+        if (log.isDebugEnabled)
+          EventFilter.debug("stopgap", occurrences = 1) intercept {
+            log.debug("stopgap")
+          }
       }
     }
 
   }
 
-  // TODO: Add parallel
-  // TODO: Add chained parallel, loopback
-  // TODO: Add inverted chains (client-server-server-client and client-server-client-server and server-client-client-server)
-  // TODO: Add no bytes, short bytes, long stream, large bytes
 }
