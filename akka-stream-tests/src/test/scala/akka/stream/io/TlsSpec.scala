@@ -377,11 +377,11 @@ class TlsSpec extends AkkaSpec("akka.loglevel=INFO\nakka.actor.debug.receive=off
             .via(debug)
             .collect { case SessionBytes(_, b) ⇒ b }
             .scan(ByteString.empty)(_ ++ _)
-            .transform(() ⇒ new Timeout(3.seconds))
+            .transform(() ⇒ new Timeout(6.seconds))
             .transform(() ⇒ new DropWhile(_.size < scenario.output.size))
             .runWith(Sink.head)
 
-        Await.result(f, 5.seconds).utf8String should be(scenario.output.utf8String)
+        Await.result(f, 8.seconds).utf8String should be(scenario.output.utf8String)
 
         commPattern.cleanup()
 
