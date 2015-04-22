@@ -53,12 +53,12 @@ object TlsSpec {
    * independent of the traffic going through. The purpose is to include the last seen
    * element in the exception message to help in figuring out what went wrong.
    */
-  class Timeout()(implicit system: ActorSystem) extends AsyncStage[ByteString, ByteString, Unit] {
+  class Timeout(duration: FiniteDuration)(implicit system: ActorSystem) extends AsyncStage[ByteString, ByteString, Unit] {
     private var last: ByteString = _
 
     override def initAsyncInput(ctx: AsyncContext[ByteString, Unit]) = {
       val cb = ctx.getAsyncCallback()
-      system.scheduler.scheduleOnce(2.seconds)(cb.invoke(()))(system.dispatcher)
+      system.scheduler.scheduleOnce(duration)(cb.invoke(()))(system.dispatcher)
     }
 
     override def onAsyncInput(u: Unit, ctx: AsyncContext[ByteString, Unit]) =
@@ -137,6 +137,7 @@ class TlsSpec extends AkkaSpec("akka.loglevel=INFO\nakka.actor.debug.receive=off
     trait CommunicationSetup extends Named {
       def decorateFlow(leftClosing: Closing, rightClosing: Closing,
                        rhs: Flow[SslTlsInbound, SslTlsOutbound, Any]): Flow[SslTlsOutbound, SslTlsInbound, Unit]
+      def cleanup(): Unit = ()
     }
 
     object ClientInitiates extends CommunicationSetup {
@@ -151,28 +152,32 @@ class TlsSpec extends AkkaSpec("akka.loglevel=INFO\nakka.actor.debug.receive=off
         serverTls(leftClosing) atop clientTls(rightClosing).reversed join rhs
     }
 
-    def server(flow: Flow[ByteString, ByteString, Any]): InetSocketAddress = {
+    def server(flow: Flow[ByteString, ByteString, Any]) = {
       val server = StreamTcp()
         .bind(new InetSocketAddress("localhost", 0))
         .to(Sink.foreach(c ⇒ c.flow.join(flow).run()))
         .run()
-      Await.result(server, 2.seconds).localAddress
+      Await.result(server, 2.seconds)
     }
 
     object ClientInitiatesViaTcp extends CommunicationSetup {
+      var binding: StreamTcp.ServerBinding = null
       def decorateFlow(leftClosing: Closing, rightClosing: Closing,
                        rhs: Flow[SslTlsInbound, SslTlsOutbound, Any]) = {
-        val local = server(serverTls(rightClosing).reversed join rhs)
-        clientTls(leftClosing) join StreamTcp().outgoingConnection(local)
+        binding = server(serverTls(rightClosing).reversed join rhs)
+        clientTls(leftClosing) join StreamTcp().outgoingConnection(binding.localAddress)
       }
+      override def cleanup(): Unit = binding.unbind()
     }
 
     object ServerInitiatesViaTcp extends CommunicationSetup {
+      var binding: StreamTcp.ServerBinding = null
       def decorateFlow(leftClosing: Closing, rightClosing: Closing,
                        rhs: Flow[SslTlsInbound, SslTlsOutbound, Any]) = {
-        val local = server(clientTls(rightClosing).reversed join rhs)
-        serverTls(leftClosing) join StreamTcp().outgoingConnection(local)
+        binding = server(clientTls(rightClosing).reversed join rhs)
+        serverTls(leftClosing) join StreamTcp().outgoingConnection(binding.localAddress)
       }
+      override def cleanup(): Unit = binding.unbind()
     }
 
     val communicationPatterns =
@@ -372,11 +377,13 @@ class TlsSpec extends AkkaSpec("akka.loglevel=INFO\nakka.actor.debug.receive=off
             .via(debug)
             .collect { case SessionBytes(_, b) ⇒ b }
             .scan(ByteString.empty)(_ ++ _)
-            .transform(() ⇒ new Timeout)
+            .transform(() ⇒ new Timeout(3.seconds))
             .transform(() ⇒ new DropWhile(_.size < scenario.output.size))
             .runWith(Sink.head)
 
-        Await.result(f, 3.seconds).utf8String should be(scenario.output.utf8String)
+        Await.result(f, 5.seconds).utf8String should be(scenario.output.utf8String)
+
+        commPattern.cleanup()
 
         // flush log so as to not mix up logs of different test cases
         if (log.isDebugEnabled)
